@@ -53,12 +53,16 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            gpui_kit::component::Theme::sync_system_appearance(None, cx);
+            // Light/dark mode follows the system; see `PaprApp::new`.
 
             cx.on_action(|_: &Quit, cx| cx.quit());
+            let ctx = Some(app::KEY_CONTEXT);
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
                 KeyBinding::new("ctrl-q", Quit, None),
+                KeyBinding::new("cmd-a", app::SelectAllPapers, ctx),
+                KeyBinding::new("ctrl-a", app::SelectAllPapers, ctx),
+                KeyBinding::new("escape", app::CloseSidePanel, ctx),
             ]);
 
             let options = WindowOptions {

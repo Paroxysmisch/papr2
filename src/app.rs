@@ -1,9 +1,9 @@
 use std::{cell::Cell, path::PathBuf, time::Duration};
 
 use gpui_kit::assets::IconName as Lucide;
-use gpui_kit::component::StyledExt as _;
 use gpui_kit::component::{
-    ActiveTheme, Icon, IconName, Sizable, WindowExt,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, StyledExt as _, Theme,
+    WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
     checkbox::Checkbox,
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -20,6 +20,11 @@ use crate::library::{CollectionId, ImportOutcome, Library, Paper, PaperId, ScanR
 /// How often to look for changes made outside the app (e.g. in a file manager).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Key context of the main view, for key bindings.
+pub const KEY_CONTEXT: &str = "PaprApp";
+
+actions!(papr2, [SelectAllPapers, CloseSidePanel]);
+
 /// Which list is shown in the main panel.
 #[derive(Clone, PartialEq, Eq)]
 enum View {
@@ -27,14 +32,14 @@ enum View {
     Collection(CollectionId),
 }
 
-/// Payload for dragging a paper row onto a collection in the sidebar.
+/// Payload for dragging one or more papers onto a collection in the sidebar.
 #[derive(Clone)]
-struct DraggedPaper {
-    id: PaperId,
-    title: SharedString,
+struct DraggedPapers {
+    ids: Vec<PaperId>,
+    label: SharedString,
 }
 
-impl Render for DraggedPaper {
+impl Render for DraggedPapers {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_2()
@@ -49,14 +54,20 @@ impl Render for DraggedPaper {
             .text_sm()
             .text_color(cx.theme().popover_foreground)
             .child(Icon::new(IconName::FileText).small())
-            .child(div().truncate().child(self.title.clone()))
+            .child(div().truncate().child(self.label.clone()))
     }
 }
 
 pub struct PaprApp {
     library: Library,
     view: View,
-    selected: Option<PaperId>,
+    /// Selected papers, in the order they were selected.
+    selection: Vec<PaperId>,
+    /// Where a Shift-click range starts.
+    anchor: Option<PaperId>,
+    /// Multi-select mode: clicks toggle papers instead of replacing the selection.
+    select_mode: bool,
+    focus_handle: FocusHandle,
     title_input: Entity<InputState>,
     search_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -69,7 +80,15 @@ impl PaprApp {
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Paper name"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search papers…"));
 
+        // Follow the system's light/dark setting, now and when it changes.
+        // (On Linux the window knows the appearance; the app-level value
+        // may not be available yet at startup.)
+        Theme::sync_system_appearance(Some(window), cx);
+
         let subscriptions = vec![
+            cx.observe_window_appearance(window, |_, window, cx| {
+                Theme::sync_system_appearance(Some(window), cx);
+            }),
             cx.subscribe_in(&title_input, window, |this, _, ev: &InputEvent, window, cx| {
                 match ev {
                     InputEvent::PressEnter { .. } | InputEvent::Blur => {
@@ -98,10 +117,17 @@ impl PaprApp {
             }
         });
 
+        // Focus the main view so keyboard shortcuts work straight away.
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
+
         Self {
             library,
             view: View::Library,
-            selected: None,
+            selection: Vec::new(),
+            anchor: None,
+            select_mode: false,
+            focus_handle,
             title_input,
             search_input,
             _subscriptions: subscriptions,
@@ -114,6 +140,15 @@ impl PaprApp {
 
     fn notify_error(window: &mut Window, cx: &mut App, err: anyhow::Error) {
         window.push_notification(Notification::error(format!("{err:#}")), cx);
+    }
+
+    /// The paper shown in the details pane, if exactly one is selected
+    /// outside of multi-select mode.
+    fn single_selection(&self) -> Option<&PaperId> {
+        match self.selection.as_slice() {
+            [id] if !self.select_mode => Some(id),
+            _ => None,
+        }
     }
 
     /// Re-scan the library folder and follow any renames.
@@ -138,19 +173,30 @@ impl PaprApp {
             }
         }
 
-        if let Some(sel) = self.selected.clone() {
-            let renamed_to = report
+        let follow = |id: &PaperId| -> PaperId {
+            report
                 .renamed_papers
                 .iter()
-                .find(|(old, _)| *old == sel)
-                .map(|(_, new)| new.clone());
-            if let Some(new) = renamed_to {
-                self.selected = Some(new);
-                self.sync_title_input(false, window, cx);
-            } else if self.library.paper(&sel).is_none() {
-                self.selected = None;
-                self.sync_title_input(true, window, cx);
-            }
+                .find(|(old, _)| old == id)
+                .map(|(_, new)| new.clone())
+                .unwrap_or_else(|| id.clone())
+        };
+        let selection: Vec<PaperId> = self
+            .selection
+            .iter()
+            .map(follow)
+            .filter(|id| self.library.paper(id).is_some())
+            .collect();
+        self.anchor = self
+            .anchor
+            .as_ref()
+            .map(follow)
+            .filter(|id| self.library.paper(id).is_some());
+        if selection != self.selection {
+            let removed = selection.len() < self.selection.len();
+            self.selection = selection;
+            self.sync_title_input(removed, window, cx);
+            cx.notify();
         }
 
         if report.changed || !report.renamed_collections.is_empty() {
@@ -164,12 +210,11 @@ impl PaprApp {
         if !force && self.title_input.read(cx).focus_handle(cx).is_focused(window) {
             return;
         }
-        let title = self
-            .selected
-            .as_deref()
-            .and_then(|id| self.library.paper(id))
-            .map(|p| p.title.clone())
-            .unwrap_or_default();
+        let title = match self.selection.as_slice() {
+            [id] => self.library.paper(id).map(|p| p.title.clone()),
+            _ => None,
+        }
+        .unwrap_or_default();
         self.title_input
             .update(cx, |input, cx| input.set_value(title, window, cx));
     }
@@ -198,33 +243,138 @@ impl PaprApp {
     }
 
     fn set_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
-        // Keep the selection only if the paper is still visible.
-        if let (Some(sel), View::Collection(cid)) = (&self.selected, &view) {
-            let visible = self
+        // Keep only selected papers that are still visible.
+        if let View::Collection(cid) = &view {
+            let members = self
                 .library
                 .collection(cid)
-                .is_some_and(|c| c.papers.contains(sel));
-            if !visible {
-                self.select_paper(None, window, cx);
-            }
+                .map(|c| c.papers.clone())
+                .unwrap_or_default();
+            let selection = self
+                .selection
+                .iter()
+                .filter(|id| members.contains(id))
+                .cloned()
+                .collect();
+            self.set_selection(selection, window, cx);
         }
         self.view = view;
         cx.notify();
     }
 
-    fn select_paper(&mut self, id: Option<PaperId>, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected == id {
+    // ----- selection ------------------------------------------------------------
+
+    fn set_selection(&mut self, ids: Vec<PaperId>, window: &mut Window, cx: &mut Context<Self>) {
+        if ids == self.selection {
             return;
         }
-        // Don't lose an in-progress rename when switching papers.
+        // Don't lose an in-progress rename when the selection changes.
         self.commit_title(window, cx);
-        self.selected = id;
+        self.selection = ids;
         self.sync_title_input(true, window, cx);
         cx.notify();
     }
 
+    fn select_paper(&mut self, id: PaperId, window: &mut Window, cx: &mut Context<Self>) {
+        self.anchor = Some(id.clone());
+        self.set_selection(vec![id], window, cx);
+    }
+
+    fn toggle_paper(&mut self, id: &PaperId, window: &mut Window, cx: &mut Context<Self>) {
+        let mut selection = self.selection.clone();
+        match selection.iter().position(|s| s == id) {
+            Some(ix) => {
+                selection.remove(ix);
+            }
+            None => selection.push(id.clone()),
+        }
+        self.anchor = Some(id.clone());
+        self.set_selection(selection, window, cx);
+    }
+
+    /// Plain click selects one paper; Ctrl/Cmd-click (or any click in
+    /// multi-select mode) toggles; Shift-click selects a range.
+    fn click_paper(
+        &mut self,
+        id: &PaperId,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        let modifiers = event.modifiers();
+        let additive = modifiers.secondary() || self.select_mode;
+
+        if modifiers.shift {
+            if let Some(anchor) = self.anchor.clone() {
+                let visible: Vec<PaperId> =
+                    self.visible_papers(cx).into_iter().map(|p| p.id).collect();
+                let from = visible.iter().position(|p| *p == anchor);
+                let to = visible.iter().position(|p| p == id);
+                if let (Some(from), Some(to)) = (from, to) {
+                    let mut range = visible[from.min(to)..=from.max(to)].to_vec();
+                    if additive {
+                        for selected in &self.selection {
+                            if !range.contains(selected) {
+                                range.push(selected.clone());
+                            }
+                        }
+                    }
+                    self.set_selection(range, window, cx);
+                    return;
+                }
+            }
+        }
+
+        if additive {
+            self.toggle_paper(id, window, cx);
+        } else {
+            self.select_paper(id.clone(), window, cx);
+            if event.click_count() == 2 {
+                self.open_paper(id, window, cx);
+            }
+        }
+    }
+
+    fn select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let all = self.visible_papers(cx).into_iter().map(|p| p.id).collect();
+        self.set_selection(all, window, cx);
+    }
+
+    /// Clears the selection and leaves multi-select mode, closing the right pane.
+    fn close_side_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_mode = false;
+        self.anchor = None;
+        self.set_selection(Vec::new(), window, cx);
+        cx.notify();
+    }
+
+    fn toggle_select_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.select_mode {
+            self.close_side_panel(window, cx);
+        } else {
+            self.commit_title(window, cx);
+            self.select_mode = true;
+            cx.notify();
+        }
+    }
+
+    fn on_select_all(&mut self, _: &SelectAllPapers, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_all(window, cx);
+    }
+
+    fn on_close_side_panel(
+        &mut self,
+        _: &CloseSidePanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_side_panel(window, cx);
+    }
+
     fn commit_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.clone() else { return };
+        let [id] = self.selection.as_slice() else { return };
+        let id = id.clone();
         let Some(current) = self.library.paper(&id).map(|p| p.title.clone()) else {
             return;
         };
@@ -237,7 +387,10 @@ impl PaprApp {
             return;
         }
         match self.library.rename_paper(&id, &value) {
-            Ok(new_id) => self.selected = Some(new_id),
+            Ok(new_id) => {
+                self.anchor = Some(new_id.clone());
+                self.selection = vec![new_id];
+            }
             Err(err) => {
                 Self::notify_error(window, cx, err);
                 self.sync_title_input(true, window, cx);
@@ -310,7 +463,7 @@ impl PaprApp {
             }
         }
 
-        let mut msg = format!("Imported {added} paper{}", if added == 1 { "" } else { "s" });
+        let mut msg = format!("Imported {}", count_papers(added));
         if duplicates > 0 {
             msg.push_str(&format!(" ({duplicates} already in library)"));
         }
@@ -319,8 +472,9 @@ impl PaprApp {
         }
         window.push_notification(Notification::success(msg), cx);
 
-        if last.is_some() {
-            self.select_paper(last, window, cx);
+        if let Some(id) = last {
+            self.select_mode = false;
+            self.select_paper(id, window, cx);
         }
         cx.notify();
     }
@@ -339,36 +493,58 @@ impl PaprApp {
         }
     }
 
-    fn confirm_delete_paper(&mut self, id: PaperId, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(paper) = self.library.paper(&id) else { return };
-        let title = paper.title.clone();
-        let path = self.library.relative_path(&id);
-        let n = self.library.collections_of(&id).count();
+    fn confirm_delete_papers(
+        &mut self,
+        ids: Vec<PaperId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, description) = match ids.as_slice() {
+            [] => return,
+            [id] => {
+                let Some(paper) = self.library.paper(id) else { return };
+                let n = self.library.collections_of(id).count();
+                let mut description =
+                    format!("{} will be deleted from disk.", self.library.relative_path(id));
+                if n > 0 {
+                    description.push_str(&format!(
+                        " It will also be removed from {n} collection{}.",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                }
+                (format!("Delete “{}”?", paper.title), description)
+            }
+            ids => (
+                format!("Delete {}?", count_papers(ids.len())),
+                "These PDFs will be deleted from Library/ and removed from every collection."
+                    .to_string(),
+            ),
+        };
+
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let this = this.clone();
-            let id = id.clone();
-            let mut description = format!("{path} will be deleted from disk.");
-            if n > 0 {
-                description.push_str(&format!(
-                    " It will also be removed from {n} collection{}.",
-                    if n == 1 { "" } else { "s" }
-                ));
-            }
+            let ids = ids.clone();
             alert
-                .title(format!("Delete “{title}”?"))
-                .description(description)
+                .title(title.clone())
+                .description(description.clone())
                 .show_cancel(true)
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, window, cx| {
-                    let id = id.clone();
                     this.update(cx, |this, cx| {
-                        if this.selected.as_ref() == Some(&id) {
-                            this.select_paper(None, window, cx);
-                        }
-                        if let Err(err) = this.library.delete_paper(&id) {
-                            Self::notify_error(window, cx, err);
+                        let selection = this
+                            .selection
+                            .iter()
+                            .filter(|id| !ids.contains(id))
+                            .cloned()
+                            .collect();
+                        this.set_selection(selection, window, cx);
+                        for id in &ids {
+                            if let Err(err) = this.library.delete_paper(id) {
+                                Self::notify_error(window, cx, err);
+                                break;
+                            }
                         }
                         cx.notify();
                     })
@@ -386,40 +562,83 @@ impl PaprApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let result = if member {
-            self.library.add_to_collection(cid, pid).map(|_| ())
+        if member {
+            self.add_papers_to_collection(cid, &[pid.to_string()], false, window, cx);
         } else {
-            self.library.remove_from_collection(cid, pid)
-        };
-        if let Err(err) = result {
-            Self::notify_error(window, cx, err);
+            self.remove_papers_from_collection(cid, &[pid.to_string()], false, window, cx);
         }
-        if !member
-            && self.view == View::Collection(cid.to_string())
-            && self.selected.as_deref() == Some(pid)
-        {
-            self.select_paper(None, window, cx);
+    }
+
+    /// Adds papers to a collection (as links; nothing is copied).
+    fn add_papers_to_collection(
+        &mut self,
+        cid: &str,
+        ids: &[PaperId],
+        announce: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut added = 0;
+        for id in ids {
+            match self.library.add_to_collection(cid, id) {
+                Ok(true) => added += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    Self::notify_error(window, cx, err);
+                    break;
+                }
+            }
+        }
+        if announce {
+            let note = match (added, ids) {
+                (0, [id]) => Notification::info(format!(
+                    "“{}” is already in “{cid}”",
+                    crate::library::title_of(id)
+                )),
+                (0, _) => Notification::info(format!("These papers are already in “{cid}”")),
+                (_, [id]) => Notification::success(format!(
+                    "Added “{}” to “{cid}”",
+                    crate::library::title_of(id)
+                )),
+                (n, _) => Notification::success(format!("Added {} to “{cid}”", count_papers(n))),
+            };
+            window.push_notification(note, cx);
         }
         cx.notify();
     }
 
-    fn drop_paper_on_collection(
+    fn remove_papers_from_collection(
         &mut self,
         cid: &str,
-        paper: &DraggedPaper,
+        ids: &[PaperId],
+        announce: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.library.add_to_collection(cid, &paper.id) {
-            Ok(true) => window.push_notification(
-                Notification::success(format!("Added “{}” to “{cid}”", paper.title)),
+        for id in ids {
+            if let Err(err) = self.library.remove_from_collection(cid, id) {
+                Self::notify_error(window, cx, err);
+                break;
+            }
+        }
+        // Papers removed from the collection being viewed disappear from the list.
+        if self.view == View::Collection(cid.to_string()) {
+            let selection = self
+                .selection
+                .iter()
+                .filter(|id| !ids.contains(id))
+                .cloned()
+                .collect();
+            self.set_selection(selection, window, cx);
+        }
+        if announce {
+            window.push_notification(
+                Notification::success(format!(
+                    "Removed {} from “{cid}”",
+                    count_papers(ids.len())
+                )),
                 cx,
-            ),
-            Ok(false) => window.push_notification(
-                Notification::info(format!("“{}” is already in “{cid}”", paper.title)),
-                cx,
-            ),
-            Err(err) => Self::notify_error(window, cx, err),
+            );
         }
         cx.notify();
     }
@@ -427,9 +646,11 @@ impl PaprApp {
     // ----- collection actions -----------------------------------------------------
 
     /// Opens a dialog to create a collection (`existing == None`) or rename one.
+    /// A new collection is created containing the papers in `add`.
     fn open_collection_dialog(
         &mut self,
         existing: Option<CollectionId>,
+        add: Vec<PaperId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -441,14 +662,15 @@ impl PaprApp {
         });
 
         // Pressing Enter in the name field submits the dialog.
-        let existing_enter = existing.clone();
+        let (existing_enter, add_enter) = (existing.clone(), add.clone());
         self.dialog_subscription = Some(cx.subscribe_in(
             &input,
             window,
             move |this, input, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { .. } = ev {
                     let name = input.read(cx).value().to_string();
-                    if this.submit_collection_dialog(existing_enter.clone(), &name, window, cx) {
+                    let (existing, add) = (existing_enter.clone(), add_enter.clone());
+                    if this.submit_collection_dialog(existing, add, &name, window, cx) {
                         window.close_dialog(cx);
                     }
                 }
@@ -457,19 +679,21 @@ impl PaprApp {
 
         let this = cx.entity().downgrade();
         let first_build = Cell::new(true);
-        let (title, ok) = match existing {
-            Some(_) => ("Rename collection", "Rename"),
-            None => ("New collection", "Create"),
+        let title = match (&existing, add.len()) {
+            (Some(_), _) => "Rename collection".to_string(),
+            (None, 0) => "New collection".to_string(),
+            (None, n) => format!("New collection with {}", count_papers(n)),
         };
+        let ok = if existing.is_some() { "Rename" } else { "Create" };
         window.open_dialog(cx, move |dialog, window, cx| {
             if first_build.replace(false) {
                 input.focus_handle(cx).focus(window, cx);
             }
             let input_ok = input.clone();
             let this = this.clone();
-            let existing = existing.clone();
+            let (existing, add) = (existing.clone(), add.clone());
             dialog
-                .title(title)
+                .title(title.clone())
                 .w(px(420.))
                 .child(Input::new(&input))
                 .footer(
@@ -479,8 +703,9 @@ impl PaprApp {
                 )
                 .on_ok(move |_, window, cx| {
                     let name = input_ok.read(cx).value().to_string();
+                    let (existing, add) = (existing.clone(), add.clone());
                     this.update(cx, |this, cx| {
-                        this.submit_collection_dialog(existing.clone(), &name, window, cx)
+                        this.submit_collection_dialog(existing, add, &name, window, cx)
                     })
                     .unwrap_or(true)
                 })
@@ -491,6 +716,7 @@ impl PaprApp {
     fn submit_collection_dialog(
         &mut self,
         existing: Option<CollectionId>,
+        add: Vec<PaperId>,
         name: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -505,9 +731,12 @@ impl PaprApp {
                 }
             }),
             None => self.library.create_collection(name).map(|new_id| {
+                if add.is_empty() {
+                    self.close_side_panel(window, cx);
+                } else {
+                    self.add_papers_to_collection(&new_id, &add, true, window, cx);
+                }
                 self.view = View::Collection(new_id);
-                self.selected = None;
-                self.sync_title_input(true, window, cx);
             }),
         };
         cx.notify();
@@ -612,7 +841,7 @@ impl PaprApp {
                         .text_color(theme.sidebar_accent_foreground)
                         .font_medium()
                 })
-                .drag_over::<DraggedPaper>(|s, _, _, cx| {
+                .drag_over::<DraggedPapers>(|s, _, _, cx| {
                     s.bg(cx.theme().drop_target)
                         .border_color(cx.theme().drag_border)
                 })
@@ -622,8 +851,8 @@ impl PaprApp {
                 })
                 .on_drop(cx.listener({
                     let cid = cid.clone();
-                    move |this, paper: &DraggedPaper, window, cx| {
-                        this.drop_paper_on_collection(&cid, paper, window, cx)
+                    move |this, papers: &DraggedPapers, window, cx| {
+                        this.add_papers_to_collection(&cid, &papers.ids, true, window, cx)
                     }
                 }))
                 .on_drop(cx.listener({
@@ -670,7 +899,12 @@ impl PaprApp {
                                     let cid = cid.clone();
                                     move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.open_collection_dialog(Some(cid.clone()), window, cx)
+                                        this.open_collection_dialog(
+                                            Some(cid.clone()),
+                                            Vec::new(),
+                                            window,
+                                            cx,
+                                        )
                                     }
                                 })),
                         )
@@ -697,6 +931,7 @@ impl PaprApp {
         });
 
         v_flex()
+            .id("sidebar")
             .w(px(230.))
             .h_full()
             .flex_shrink_0()
@@ -705,12 +940,17 @@ impl PaprApp {
             .border_r_1()
             .border_color(theme.sidebar_border)
             .text_sm()
+            // Clicking anywhere in the sidebar closes the right-hand pane.
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.close_side_panel(window, cx)
+            }))
             .child(
                 h_flex()
                     .gap_2()
                     .pl_4()
                     .pr_2()
-                    .h(px(52.))
+                    .h(px(TOOLBAR_HEIGHT))
+                    .flex_shrink_0()
                     .text_base()
                     .font_semibold()
                     .child(Icon::new(Lucide::LibraryBig))
@@ -745,7 +985,7 @@ impl PaprApp {
                             .icon(Lucide::FolderPlus)
                             .tooltip("New collection")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_collection_dialog(None, window, cx)
+                                this.open_collection_dialog(None, Vec::new(), window, cx)
                             })),
                     ),
             )
@@ -781,15 +1021,23 @@ impl PaprApp {
     fn render_paper_row(&self, ix: usize, paper: &Paper, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let id = paper.id.clone();
-        let selected = self.selected.as_ref() == Some(&id);
+        let selected = self.selection.contains(&id);
         let collections: Vec<&str> = self.library.collections_of(&id).map(|c| c.name()).collect();
         let mut subtitle = format_size(paper.size_bytes);
         if !collections.is_empty() {
             subtitle.push_str(&format!(" · {}", collections.join(", ")));
         }
-        let drag = DraggedPaper {
-            id: id.clone(),
-            title: paper.title.clone().into(),
+        // Dragging a selected paper drags the whole selection.
+        let drag = if selected && self.selection.len() > 1 {
+            DraggedPapers {
+                ids: self.selection.clone(),
+                label: count_papers(self.selection.len()).into(),
+            }
+        } else {
+            DraggedPapers {
+                ids: vec![id.clone()],
+                label: paper.title.clone().into(),
+            }
         };
 
         h_flex()
@@ -804,16 +1052,19 @@ impl PaprApp {
             .when(selected, |s| s.bg(theme.list_active))
             .on_click(cx.listener({
                 let id = id.clone();
-                move |this, ev: &ClickEvent, window, cx| {
-                    this.select_paper(Some(id.clone()), window, cx);
-                    if let ClickEvent::Mouse(m) = ev {
-                        if m.down.click_count == 2 {
-                            this.open_paper(&id, window, cx);
-                        }
-                    }
-                }
+                move |this, ev: &ClickEvent, window, cx| this.click_paper(&id, ev, window, cx)
             }))
             .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            .when(self.select_mode, |row| {
+                row.child(
+                    Checkbox::new(ElementId::NamedInteger("pick".into(), ix as u64))
+                        .checked(selected)
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _: &bool, window, cx| this.toggle_paper(&id, window, cx)
+                        })),
+                )
+            })
             .child(Icon::new(IconName::FileText).text_color(theme.muted_foreground))
             .child(
                 v_flex()
@@ -854,44 +1105,56 @@ impl PaprApp {
             View::Collection(_) => format!("Drop PDFs here to add them to “{heading}”"),
         };
 
-        let toolbar = h_flex()
-            .gap_3()
+        // Two rows: the title (aligned with the sidebar and side-pane
+        // headers), then full-size search and actions, which keeps everything
+        // readable when the window is narrow.
+        let title_row = h_flex()
             .px_4()
-            .h(px(52.))
+            .h(px(TOOLBAR_HEIGHT))
             .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border)
             .child(
                 h_flex()
                     .flex_1()
-                    .min_w(px(140.))
+                    .min_w_0()
                     .gap_2()
                     .items_baseline()
-                    .child(div().truncate().text_lg().font_semibold().child(heading))
+                    .child(div().min_w_0().truncate().text_xl().font_semibold().child(heading))
                     .child(
                         div()
                             .flex_shrink_0()
                             .text_sm()
                             .text_color(theme.muted_foreground)
-                            .child(format!(
-                                "{} paper{}",
-                                papers.len(),
-                                if papers.len() == 1 { "" } else { "s" }
-                            )),
+                            .child(count_papers(papers.len())),
                     ),
-            )
+            );
+        let controls_row = h_flex()
+            .gap_2()
+            .px_4()
+            .pb_3()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme.border)
             .child(
-                div().w(px(240.)).min_w(px(100.)).flex_shrink(1.).child(
+                div().flex_1().min_w(px(120.)).child(
                     Input::new(&self.search_input)
-                        .small()
                         .cleanable(true)
                         .prefix(Icon::new(IconName::Search).small()),
                 ),
             )
             .child(
+                Button::new("select-mode")
+                    .flex_shrink_0()
+                    .outline()
+                    .icon(IconName::Check)
+                    .label(if self.select_mode { "Done" } else { "Select" })
+                    .selected(self.select_mode)
+                    .tooltip("Select multiple papers (or Ctrl/Cmd-click, Shift-click)")
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_select_mode(window, cx))),
+            )
+            .child(
                 Button::new("import")
+                    .flex_shrink_0()
                     .primary()
-                    .small()
                     .icon(Lucide::FilePlus)
                     .label("Add PDFs…")
                     .on_click(cx.listener(Self::prompt_import)),
@@ -933,7 +1196,8 @@ impl PaprApp {
             .min_w_0()
             .overflow_hidden()
             .h_full()
-            .child(toolbar)
+            .child(title_row)
+            .child(controls_row)
             .child(
                 v_flex()
                     .id("drop-area")
@@ -945,7 +1209,55 @@ impl PaprApp {
                         s.bg(cx.theme().drop_target)
                             .border_color(cx.theme().drag_border)
                     })
+                    // Clicking empty space (rows handle their own clicks)
+                    // closes the right-hand pane.
+                    .on_click(cx.listener(|this, _, window, cx| this.close_side_panel(window, cx)))
                     .child(body),
+            )
+    }
+
+    /// The right-hand pane's frame: a title with a close button, then content.
+    fn side_panel(
+        &self,
+        title: impl Into<SharedString>,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let theme = cx.theme();
+        v_flex()
+            .id("side-panel")
+            .w(px(300.))
+            .h_full()
+            .flex_shrink_0()
+            .overflow_y_scroll()
+            .px_4()
+            .pb_4()
+            .border_l_1()
+            .border_color(theme.border)
+            .text_sm()
+            .child(
+                h_flex()
+                    .h(px(TOOLBAR_HEIGHT))
+                    .flex_shrink_0()
+                    .gap_2()
+                    .justify_between()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_base()
+                            .font_semibold()
+                            .child(title.into()),
+                    )
+                    .child(
+                        Button::new("close-panel")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Close)
+                            .tooltip("Close (Esc)")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_side_panel(window, cx)
+                            })),
+                    ),
             )
     }
 
@@ -953,15 +1265,6 @@ impl PaprApp {
         let theme = cx.theme();
         let id = paper.id.clone();
 
-        let section = |label: &'static str| {
-            div()
-                .mt_4()
-                .mb_1()
-                .text_xs()
-                .font_medium()
-                .text_color(theme.muted_foreground)
-                .child(label)
-        };
         let info_row = |label: &'static str, value: String| {
             h_flex()
                 .gap_2()
@@ -975,6 +1278,7 @@ impl PaprApp {
                 )
                 .child(div().min_w_0().truncate().child(value))
         };
+        let hint = theme.muted_foreground;
 
         let memberships = self.library.collections().iter().enumerate().map(|(ix, c)| {
             let cid = c.id.clone();
@@ -994,35 +1298,33 @@ impl PaprApp {
                 Some(
                     Button::new("remove-from-collection")
                         .outline()
-                        .small()
                         .w_full()
                         .icon(Lucide::FolderMinus)
                         .label(format!("Remove from “{cid}”"))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.set_membership(&cid, &id, false, window, cx)
+                            this.remove_papers_from_collection(
+                                &cid,
+                                &[id.clone()],
+                                false,
+                                window,
+                                cx,
+                            )
                         })),
                 )
             }
             View::Library => None,
         };
 
-        v_flex()
-            .id("details")
-            .w(px(290.))
-            .h_full()
-            .flex_shrink_0()
-            .overflow_y_scroll()
-            .p_4()
-            .border_l_1()
-            .border_color(theme.border)
-            .text_sm()
-            .child(section("NAME"))
+        let no_collections = self.library.collections().is_empty();
+
+        self.side_panel("Details", cx)
+            .child(section_label("NAME", hint).mt_0())
             .child(Input::new(&self.title_input))
             .child(
                 div()
                     .mt_1()
                     .text_xs()
-                    .text_color(theme.muted_foreground)
+                    .text_color(hint)
                     .child("Renames the PDF file. Press Enter to save."),
             )
             .child(
@@ -1043,7 +1345,6 @@ impl PaprApp {
                     .child(
                         Button::new("reveal")
                             .outline()
-                            .small()
                             .w_full()
                             .icon(IconName::FolderOpen)
                             .label("Show in folder")
@@ -1055,7 +1356,7 @@ impl PaprApp {
                             })),
                     ),
             )
-            .child(section("INFO"))
+            .child(section_label("INFO", hint))
             .child(
                 v_flex()
                     .gap_1()
@@ -1063,18 +1364,13 @@ impl PaprApp {
                     .child(info_row("Size", format_size(paper.size_bytes)))
                     .child(info_row("Modified", format_date(paper.modified))),
             )
-            .child(section("COLLECTIONS"))
+            .child(section_label("COLLECTIONS", hint))
             .child(
                 v_flex()
                     .gap_2()
                     .children(memberships)
-                    .when(self.library.collections().is_empty(), |s| {
-                        s.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child("No collections yet."),
-                        )
+                    .when(no_collections, |s| {
+                        s.child(div().text_xs().text_color(hint).child("No collections yet."))
                     }),
             )
             .child(
@@ -1085,29 +1381,149 @@ impl PaprApp {
                     .child(
                         Button::new("delete-paper")
                             .danger()
-                            .small()
                             .w_full()
                             .icon(Lucide::Trash)
                             .label("Delete from library")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.confirm_delete_paper(id.clone(), window, cx)
+                                this.confirm_delete_papers(vec![id.clone()], window, cx)
                             })),
                     ),
             )
             .into_any_element()
     }
+
+    /// The right-hand pane in multi-select mode: actions for every selected paper.
+    fn render_bulk_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hint = cx.theme().muted_foreground;
+        let n = self.selection.len();
+        let title = if n == 0 {
+            "Select papers".to_string()
+        } else {
+            format!("{} selected", count_papers(n))
+        };
+
+        let add_buttons = self.library.collections().iter().enumerate().map(|(ix, c)| {
+            let cid = c.id.clone();
+            let all_in = self.selection.iter().all(|id| c.papers.contains(id));
+            Button::new(ElementId::NamedInteger("add-to".into(), ix as u64))
+                .outline()
+                .w_full()
+                .icon(if all_in { IconName::Check } else { IconName::Folder })
+                .label(c.name().to_string())
+                .disabled(all_in)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let ids = this.selection.clone();
+                    this.add_papers_to_collection(&cid, &ids, true, window, cx)
+                }))
+        });
+
+        let remove_from_current = match &self.view {
+            View::Collection(cid) => {
+                let cid = cid.clone();
+                Some(
+                    Button::new("remove-selection")
+                        .outline()
+                        .w_full()
+                        .icon(Lucide::FolderMinus)
+                        .label(format!("Remove from “{cid}”"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let ids = this.selection.clone();
+                            this.remove_papers_from_collection(&cid, &ids, true, window, cx)
+                        })),
+                )
+            }
+            View::Library => None,
+        };
+
+        self.side_panel(title, cx)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(hint)
+                    .child("Click papers to select them; Shift-click selects a range."),
+            )
+            .child(
+                h_flex()
+                    .mt_3()
+                    .gap_2()
+                    .child(
+                        Button::new("select-all")
+                            .outline()
+                            .flex_1()
+                            .label("Select all")
+                            .on_click(cx.listener(|this, _, window, cx| this.select_all(window, cx))),
+                    )
+                    .child(
+                        Button::new("clear-selection")
+                            .outline()
+                            .flex_1()
+                            .label("Clear")
+                            .disabled(n == 0)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_selection(Vec::new(), window, cx)
+                            })),
+                    ),
+            )
+            .when(n > 0, |panel| {
+                panel
+                    .child(section_label("ADD TO COLLECTION", hint))
+                    .child(
+                        v_flex().gap_2().children(add_buttons).child(
+                            Button::new("new-collection-from-selection")
+                                .ghost()
+                                .w_full()
+                                .icon(Lucide::FolderPlus)
+                                .label("New collection…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let ids = this.selection.clone();
+                                    this.open_collection_dialog(None, ids, window, cx)
+                                })),
+                        ),
+                    )
+                    .child(
+                        v_flex()
+                            .mt_6()
+                            .gap_2()
+                            .children(remove_from_current)
+                            .child(
+                                Button::new("delete-selection")
+                                    .danger()
+                                    .w_full()
+                                    .icon(Lucide::Trash)
+                                    .label(format!("Delete {}", count_papers(n)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let ids = this.selection.clone();
+                                        this.confirm_delete_papers(ids, window, cx)
+                                    })),
+                            ),
+                    )
+            })
+            .into_any_element()
+    }
 }
+
+const TOOLBAR_HEIGHT: f32 = 60.;
 
 impl Render for PaprApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self
-            .selected
-            .as_deref()
+        let side_panel = if let Some(paper) = self
+            .single_selection()
             .and_then(|id| self.library.paper(id))
-            .cloned();
+            .cloned()
+        {
+            Some(self.render_details(&paper, cx))
+        } else if self.select_mode || self.selection.len() > 1 {
+            Some(self.render_bulk_actions(cx))
+        } else {
+            None
+        };
 
         h_flex()
             .id("papr2")
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_close_side_panel))
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -1117,8 +1533,22 @@ impl Render for PaprApp {
             }))
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
-            .children(selected.map(|paper| self.render_details(&paper, cx)))
+            .children(side_panel)
     }
+}
+
+fn section_label(label: &'static str, color: Hsla) -> Div {
+    div()
+        .mt_5()
+        .mb_1p5()
+        .text_xs()
+        .font_medium()
+        .text_color(color)
+        .child(label)
+}
+
+fn count_papers(n: usize) -> String {
+    format!("{n} paper{}", if n == 1 { "" } else { "s" })
 }
 
 /// Collect PDFs from a path, descending into directories.
@@ -1166,7 +1596,7 @@ fn format_date(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     // Explicit imports: `gpui_kit::*` also exports GPUI's `test` macro.
-    use super::{format_date, format_size};
+    use super::{count_papers, format_date, format_size};
 
     #[test]
     fn formats_dates() {
@@ -1179,5 +1609,11 @@ mod tests {
         assert_eq!(format_size(512), "512 B");
         assert_eq!(format_size(2048), "2 KB");
         assert_eq!(format_size(3 * 1024 * 1024), "3.0 MB");
+    }
+
+    #[test]
+    fn counts_papers() {
+        assert_eq!(count_papers(1), "1 paper");
+        assert_eq!(count_papers(3), "3 papers");
     }
 }

@@ -12,6 +12,12 @@ A small research-paper manager written in Rust with [gpui-kit](https://gpui-kit.
 - **Rename** a paper in the details pane. This renames the PDF file itself.
 - **Open PDF** opens the file in the system's default PDF viewer (double-clicking a row does the same).
 - **Search** filters papers by name.
+- **Multi-select**: click **Select** (or Ctrl/Cmd-click, Shift-click for a range, Ctrl/Cmd+A for
+  all) to select several papers. You can then add them all to a collection, start a new collection
+  from them, remove them from the current collection, delete them, or drag them onto a collection.
+- **Right-hand pane**: closes with its × button, Esc, or by clicking the sidebar or empty space in
+  the list.
+- **Light/dark mode** follows the system setting, including changes while papr2 is running.
 
 ## Storage: just files and folders
 
