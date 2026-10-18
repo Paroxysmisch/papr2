@@ -1057,12 +1057,11 @@ impl PaprApp {
             .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
             .when(self.select_mode, |row| {
                 row.child(
+                    // Display only: the row's click handler does the toggling.
+                    // (Click events bubble to parents in GPUI, so giving the
+                    // checkbox its own handler would toggle twice.)
                     Checkbox::new(ElementId::NamedInteger("pick".into(), ix as u64))
-                        .checked(selected)
-                        .on_click(cx.listener({
-                            let id = id.clone();
-                            move |this, _: &bool, window, cx| this.toggle_paper(&id, window, cx)
-                        })),
+                        .checked(selected),
                 )
             })
             .child(Icon::new(IconName::FileText).text_color(theme.muted_foreground))
@@ -1086,9 +1085,13 @@ impl PaprApp {
                     .icon(IconName::ExternalLink)
                     .tooltip("Open PDF")
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        // Don't also select/toggle the row.
+                        cx.stop_propagation();
                         this.open_paper(&id, window, cx)
                     })),
             )
+            // Lets UI tests click rows; a no-op in normal builds.
+            .test_support()
             .into_any_element()
     }
 
@@ -1169,6 +1172,7 @@ impl PaprApp {
             v_flex()
                 .id("empty")
                 .flex_1()
+                .on_click(cx.listener(|this, _, window, cx| this.close_side_panel(window, cx)))
                 .items_center()
                 .justify_center()
                 .gap_2()
@@ -1188,6 +1192,19 @@ impl PaprApp {
                         .enumerate()
                         .map(|(ix, p)| self.render_paper_row(ix, p, cx))
                         .collect::<Vec<_>>(),
+                )
+                // Empty space below the rows: clicking it closes the right-hand
+                // pane. It's a sibling of the rows, not a parent, because
+                // clicks bubble to parents and would undo the row's selection.
+                .child(
+                    div()
+                        .id("list-background")
+                        .flex_1()
+                        .min_h(px(48.))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.close_side_panel(window, cx)
+                        }))
+                        .test_support(),
                 )
         };
 
@@ -1209,9 +1226,6 @@ impl PaprApp {
                         s.bg(cx.theme().drop_target)
                             .border_color(cx.theme().drag_border)
                     })
-                    // Clicking empty space (rows handle their own clicks)
-                    // closes the right-hand pane.
-                    .on_click(cx.listener(|this, _, window, cx| this.close_side_panel(window, cx)))
                     .child(body),
             )
     }
@@ -1615,5 +1629,154 @@ mod tests {
     fn counts_papers() {
         assert_eq!(count_papers(1), "1 paper");
         assert_eq!(count_papers(3), "3 papers");
+    }
+}
+
+/// Headless UI tests: render the real view and click it with real hit-testing.
+#[cfg(test)]
+mod ui_tests {
+    // Explicit imports: `gpui_kit::*` also exports GPUI's `test` macro.
+    use super::PaprApp;
+    use crate::library::Library;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        AnyWindowHandle, AppContext as _, Bounds, ElementId, Entity, Point, TestAppContext,
+        WindowBounds, WindowOptions, px, size,
+    };
+    use std::path::PathBuf;
+
+    /// A library with three papers: "A paper", "B paper", "C paper".
+    struct Fixture {
+        root: PathBuf,
+        window: AnyWindowHandle,
+        app: Entity<PaprApp>,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn open(cx: &mut TestAppContext, name: &str) -> Fixture {
+        let root = std::env::temp_dir().join(format!("papr2-ui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Library")).unwrap();
+        for title in ["A paper", "B paper", "C paper"] {
+            std::fs::write(root.join(format!("Library/{title}.pdf")), title).unwrap();
+        }
+        let library = Library::open(&root).unwrap();
+
+        let (window, app) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let bounds = Bounds {
+                origin: Point::default(),
+                size: size(px(1200.), px(800.)),
+            };
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| cx.new(|cx| PaprApp::new(library, window, cx)),
+            )
+            .unwrap()
+        });
+        Fixture { root, window, app }
+    }
+
+    fn row(ix: u64) -> ElementId {
+        ElementId::NamedInteger("paper".into(), ix)
+    }
+
+    fn click(f: &Fixture, cx: &mut TestAppContext, id: impl Into<ElementId>) {
+        let id = id.into();
+        cx.update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(id, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn selection(f: &Fixture, cx: &mut TestAppContext) -> Vec<String> {
+        f.app.read_with(cx, |app, _| app.selection.clone())
+    }
+
+    fn select_mode(f: &Fixture, cx: &mut TestAppContext) -> bool {
+        f.app.read_with(cx, |app, _| app.select_mode)
+    }
+
+    fn panel_open(f: &Fixture, cx: &mut TestAppContext) -> bool {
+        cx.update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find("close-panel").is_some()
+        })
+        .unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_paper_selects_it_and_opens_details(cx: &mut TestAppContext) {
+        let f = open(cx, "click");
+        click(&f, cx, row(1));
+        assert_eq!(selection(&f, cx), vec!["B paper.pdf"]);
+        assert!(panel_open(&f, cx));
+
+        // Clicking another paper switches the selection.
+        click(&f, cx, row(2));
+        assert_eq!(selection(&f, cx), vec!["C paper.pdf"]);
+    }
+
+    #[gpui_kit::test]
+    fn select_mode_toggles_papers(cx: &mut TestAppContext) {
+        let f = open(cx, "select");
+        click(&f, cx, "select-mode");
+        assert!(select_mode(&f, cx));
+
+        click(&f, cx, row(0));
+        click(&f, cx, row(2));
+        assert_eq!(selection(&f, cx), vec!["A paper.pdf", "C paper.pdf"]);
+        assert!(select_mode(&f, cx), "clicking rows must not leave select mode");
+
+        // Clicking a selected paper deselects it.
+        click(&f, cx, row(0));
+        assert_eq!(selection(&f, cx), vec!["C paper.pdf"]);
+
+        // "Done" leaves select mode and clears the selection.
+        click(&f, cx, "select-mode");
+        assert!(!select_mode(&f, cx));
+        assert!(selection(&f, cx).is_empty());
+    }
+
+    #[gpui_kit::test]
+    fn the_side_panel_closes(cx: &mut TestAppContext) {
+        let f = open(cx, "close");
+
+        // With the close button.
+        click(&f, cx, row(0));
+        assert!(panel_open(&f, cx));
+        click(&f, cx, "close-panel");
+        assert!(!panel_open(&f, cx));
+        assert!(selection(&f, cx).is_empty());
+
+        // By clicking empty space below the papers.
+        click(&f, cx, row(0));
+        assert!(panel_open(&f, cx));
+        click(&f, cx, "list-background");
+        assert!(!panel_open(&f, cx));
+    }
+
+    #[gpui_kit::test]
+    fn the_open_button_does_not_toggle_selection(cx: &mut TestAppContext) {
+        let f = open(cx, "open-button");
+        click(&f, cx, "select-mode");
+        click(&f, cx, row(0));
+        assert_eq!(selection(&f, cx), vec!["A paper.pdf"]);
+        // The test platform can't launch a viewer, so remove the file:
+        // Open then just reports it missing.
+        std::fs::remove_file(f.root.join("Library/A paper.pdf")).unwrap();
+        click(&f, cx, ElementId::NamedInteger("open".into(), 0));
+        assert_eq!(selection(&f, cx), vec!["A paper.pdf"]);
     }
 }

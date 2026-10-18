@@ -69,3 +69,6 @@ cargo run --release
 ```sh
 cargo test
 ```
+
+Besides library tests, this runs headless UI tests that click through the real interface
+(selection, Select mode, closing the side pane).
