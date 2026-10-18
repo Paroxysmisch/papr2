@@ -1147,6 +1147,7 @@ impl PaprApp {
             .child(
                 Button::new("select-mode")
                     .flex_shrink_0()
+                    .w(px(TOOLBAR_BUTTON_WIDTH))
                     .outline()
                     .icon(IconName::Check)
                     .label(if self.select_mode { "Done" } else { "Select" })
@@ -1155,11 +1156,14 @@ impl PaprApp {
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_select_mode(window, cx))),
             )
             .child(
+                // Matches the Select button: same style and width.
                 Button::new("import")
                     .flex_shrink_0()
-                    .primary()
+                    .w(px(TOOLBAR_BUTTON_WIDTH))
+                    .outline()
                     .icon(Lucide::FilePlus)
-                    .label("Add PDFs…")
+                    .label("Add")
+                    .tooltip("Add PDFs…")
                     .on_click(cx.listener(Self::prompt_import)),
             );
 
@@ -1517,6 +1521,8 @@ impl PaprApp {
 }
 
 const TOOLBAR_HEIGHT: f32 = 60.;
+/// Width of the Select/Done and Add buttons next to the search bar.
+const TOOLBAR_BUTTON_WIDTH: f32 = 88.;
 
 impl Render for PaprApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

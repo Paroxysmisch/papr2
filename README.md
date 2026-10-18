@@ -4,7 +4,7 @@ A small research-paper manager written in Rust with [gpui-kit](https://gpui-kit.
 
 ## Features
 
-- **Library**: drag and drop PDFs (or whole folders) onto the window, or use **Add PDFs…**.
+- **Library**: drag and drop PDFs (or whole folders) onto the window, or use the **Add** button.
   Each PDF is copied into `Library/` once. Importing the same file again is detected by content.
 - **Collections** (e.g. one per project): you can add the same paper to several collections without
   copying the PDF. Drag papers from the list onto a collection, tick it in the details pane, or drop
