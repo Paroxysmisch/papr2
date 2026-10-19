@@ -1,3 +1,5 @@
+mod scholar_view;
+
 use std::{cell::Cell, path::PathBuf, time::Duration};
 
 use gpui_kit::assets::IconName as Lucide;
@@ -15,7 +17,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::library::{CollectionId, ImportOutcome, Library, Paper, PaperId, ScanReport, is_pdf};
+use crate::library::{
+    CollectionId, EXPORT_FILE, ImportOutcome, Library, Paper, PaperId, ScanReport, is_pdf,
+};
+use scholar_view::ScholarState;
 
 /// How often to look for changes made outside the app (e.g. in a file manager).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -30,6 +35,8 @@ actions!(papr2, [SelectAllPapers, CloseSidePanel]);
 enum View {
     Library,
     Collection(CollectionId),
+    /// Search Google Scholar and add papers from the results.
+    Scholar,
 }
 
 /// Payload for dragging one or more papers onto a collection in the sidebar.
@@ -70,6 +77,7 @@ pub struct PaprApp {
     focus_handle: FocusHandle,
     title_input: Entity<InputState>,
     search_input: Entity<InputState>,
+    scholar: ScholarState,
     _subscriptions: Vec<Subscription>,
     dialog_subscription: Option<Subscription>,
     _refresh_task: Task<()>,
@@ -79,6 +87,7 @@ impl PaprApp {
     pub fn new(library: Library, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Paper name"));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search papers…"));
+        let (scholar, scholar_subscription) = ScholarState::new(window, cx);
 
         // Follow the system's light/dark setting, now and when it changes.
         // (On Linux the window knows the appearance; the app-level value
@@ -102,6 +111,7 @@ impl PaprApp {
                     cx.notify();
                 }
             }),
+            scholar_subscription,
         ];
 
         // Poll the library folder so edits made in a file manager show up.
@@ -130,6 +140,7 @@ impl PaprApp {
             focus_handle,
             title_input,
             search_input,
+            scholar,
             _subscriptions: subscriptions,
             dialog_subscription: None,
             _refresh_task: refresh_task,
@@ -192,6 +203,7 @@ impl PaprApp {
             .as_ref()
             .map(follow)
             .filter(|id| self.library.paper(id).is_some());
+        self.scholar.follow_renames(&report.renamed_papers);
         if selection != self.selection {
             let removed = selection.len() < self.selection.len();
             self.selection = selection;
@@ -211,7 +223,7 @@ impl PaprApp {
             return;
         }
         let title = match self.selection.as_slice() {
-            [id] => self.library.paper(id).map(|p| p.title.clone()),
+            [id] => self.library.paper(id).map(|p| p.title().to_string()),
             _ => None,
         }
         .unwrap_or_default();
@@ -223,7 +235,7 @@ impl PaprApp {
     fn visible_papers(&self, cx: &App) -> Vec<Paper> {
         let query = self.search_input.read(cx).value().trim().to_lowercase();
         let mut papers: Vec<Paper> = match &self.view {
-            View::Library => self.library.papers().to_vec(),
+            View::Library | View::Scholar => self.library.papers().to_vec(),
             View::Collection(cid) => self
                 .library
                 .collection(cid)
@@ -236,27 +248,40 @@ impl PaprApp {
                 .unwrap_or_default(),
         };
         if !query.is_empty() {
-            papers.retain(|p| p.title.to_lowercase().contains(&query));
+            papers.retain(|p| {
+                p.title().to_lowercase().contains(&query)
+                    || p.info().is_some_and(|i| {
+                        i.authors.iter().any(|a| a.to_lowercase().contains(&query))
+                            || i.title.as_ref().is_some_and(|t| t.to_lowercase().contains(&query))
+                    })
+            });
         }
-        papers.sort_by_key(|p| p.title.to_lowercase());
+        papers.sort_by_key(|p| p.title().to_lowercase());
         papers
     }
 
     fn set_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
         // Keep only selected papers that are still visible.
-        if let View::Collection(cid) = &view {
-            let members = self
-                .library
-                .collection(cid)
-                .map(|c| c.papers.clone())
-                .unwrap_or_default();
-            let selection = self
-                .selection
-                .iter()
-                .filter(|id| members.contains(id))
-                .cloned()
-                .collect();
-            self.set_selection(selection, window, cx);
+        match &view {
+            View::Collection(cid) => {
+                let members = self
+                    .library
+                    .collection(cid)
+                    .map(|c| c.papers.clone())
+                    .unwrap_or_default();
+                let selection = self
+                    .selection
+                    .iter()
+                    .filter(|id| members.contains(id))
+                    .cloned()
+                    .collect();
+                self.set_selection(selection, window, cx);
+            }
+            View::Scholar => {
+                self.select_mode = false;
+                self.set_selection(Vec::new(), window, cx);
+            }
+            View::Library => {}
         }
         self.view = view;
         cx.notify();
@@ -337,12 +362,18 @@ impl PaprApp {
     }
 
     fn select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Scholar {
+            return;
+        }
         let all = self.visible_papers(cx).into_iter().map(|p| p.id).collect();
         self.set_selection(all, window, cx);
     }
 
     /// Clears the selection and leaves multi-select mode, closing the right pane.
     fn close_side_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Scholar {
+            self.scholar.close_result();
+        }
         self.select_mode = false;
         self.anchor = None;
         self.set_selection(Vec::new(), window, cx);
@@ -375,7 +406,7 @@ impl PaprApp {
     fn commit_title(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let [id] = self.selection.as_slice() else { return };
         let id = id.clone();
-        let Some(current) = self.library.paper(&id).map(|p| p.title.clone()) else {
+        let Some(current) = self.library.paper(&id).map(|p| p.title().to_string()) else {
             return;
         };
         let value = self.title_input.read(cx).value().trim().to_string();
@@ -419,6 +450,18 @@ impl PaprApp {
         .detach();
     }
 
+    /// Files dropped on the window: in the Scholar view they become the PDF
+    /// of the paper just added; elsewhere they're imported.
+    fn drop_files(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Scholar {
+            if let Some(id) = self.scholar.paper_awaiting_pdf(&self.library) {
+                self.attach_pdf_from(&id, paths.paths(), window, cx);
+                return;
+            }
+        }
+        self.import_paths(paths.paths(), None, window, cx)
+    }
+
     /// Import PDFs (directories are searched recursively). Imported papers are
     /// also added to `into` or, if that's `None`, to the collection currently
     /// being viewed.
@@ -431,7 +474,7 @@ impl PaprApp {
     ) {
         let target = into.or(match &self.view {
             View::Collection(cid) => Some(cid.clone()),
-            View::Library => None,
+            View::Library | View::Scholar => None,
         });
 
         let mut pdfs = Vec::new();
@@ -473,6 +516,9 @@ impl PaprApp {
         window.push_notification(Notification::success(msg), cx);
 
         if let Some(id) = last {
+            if self.view == View::Scholar {
+                self.view = View::Library;
+            }
             self.select_mode = false;
             self.select_paper(id, window, cx);
         }
@@ -482,14 +528,100 @@ impl PaprApp {
     // ----- paper actions --------------------------------------------------------
 
     fn open_paper(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let path = self.library.paper_path(id);
-        if path.exists() {
-            cx.open_with_system(&path);
-        } else {
-            window.push_notification(
+        match self.library.pdf_path(id) {
+            Some(path) if path.exists() => cx.open_with_system(&path),
+            Some(path) => window.push_notification(
                 Notification::error(format!("The file {} is missing", path.display())),
                 cx,
-            );
+            ),
+            None => window.push_notification(
+                Notification::warning(format!("“{id}” has no PDF yet. Attach one first.")),
+                cx,
+            ),
+        }
+    }
+
+    /// Attach (or replace) a paper's PDF from the first PDF in `paths`.
+    fn attach_pdf_from(
+        &mut self,
+        id: &str,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pdf) = paths.iter().find(|p| is_pdf(p)) else {
+            window.push_notification(Notification::warning("That isn't a PDF file"), cx);
+            return;
+        };
+        let replacing = self.library.paper(id).is_some_and(|p| p.pdf.is_some());
+        match self.library.attach_pdf(id, pdf) {
+            Ok(()) => window.push_notification(
+                Notification::success(if replacing {
+                    format!("Replaced the PDF of “{id}”")
+                } else {
+                    format!("Attached the PDF to “{id}”")
+                }),
+                cx,
+            ),
+            Err(err) => Self::notify_error(window, cx, err),
+        }
+        cx.notify();
+    }
+
+    /// Asks for a PDF file, then attaches it to (or replaces it in) a paper.
+    fn prompt_attach_pdf(&mut self, id: PaperId, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Attach PDF".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                this.update_in(cx, |this, window, cx| {
+                    this.attach_pdf_from(&id, &paths, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// PDFs dropped onto the details pane: attach, or confirm replacing.
+    fn drop_pdf_on_paper(
+        &mut self,
+        id: PaperId,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.library.paper(&id).is_some_and(|p| p.pdf.is_some()) {
+            self.attach_pdf_from(&id, &paths, window, cx);
+            return;
+        }
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (this, id, paths) = (this.clone(), id.clone(), paths.clone());
+            alert
+                .title(format!("Replace the PDF of “{id}”?"))
+                .description("The current PDF will be overwritten with the one you dropped.")
+                .show_cancel(true)
+                .ok_text("Replace")
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |this, cx| this.attach_pdf_from(&id, &paths, window, cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+
+    fn copy_bibtex(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.library.read_bib(id) {
+            Some(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                window.push_notification(Notification::success("Copied the BibTeX entry"), cx);
+            }
+            None => window.push_notification(Notification::error("Couldn't read the .bib file"), cx),
         }
     }
 
@@ -502,21 +634,25 @@ impl PaprApp {
         let (title, description) = match ids.as_slice() {
             [] => return,
             [id] => {
-                let Some(paper) = self.library.paper(id) else { return };
+                if self.library.paper(id).is_none() {
+                    return;
+                }
                 let n = self.library.collections_of(id).count();
-                let mut description =
-                    format!("{} will be deleted from disk.", self.library.relative_path(id));
+                let mut description = format!(
+                    "{} will be deleted from disk.",
+                    self.library.relative_paths(id).join(" and ")
+                );
                 if n > 0 {
                     description.push_str(&format!(
                         " It will also be removed from {n} collection{}.",
                         if n == 1 { "" } else { "s" }
                     ));
                 }
-                (format!("Delete “{}”?", paper.title), description)
+                (format!("Delete “{id}”?"), description)
             }
             ids => (
                 format!("Delete {}?", count_papers(ids.len())),
-                "These PDFs will be deleted from Library/ and removed from every collection."
+                "Their PDF and BibTeX files will be deleted from Library/ and removed from every collection."
                     .to_string(),
             ),
         };
@@ -591,15 +727,9 @@ impl PaprApp {
         }
         if announce {
             let note = match (added, ids) {
-                (0, [id]) => Notification::info(format!(
-                    "“{}” is already in “{cid}”",
-                    crate::library::title_of(id)
-                )),
+                (0, [id]) => Notification::info(format!("“{id}” is already in “{cid}”")),
                 (0, _) => Notification::info(format!("These papers are already in “{cid}”")),
-                (_, [id]) => Notification::success(format!(
-                    "Added “{}” to “{cid}”",
-                    crate::library::title_of(id)
-                )),
+                (_, [id]) => Notification::success(format!("Added “{id}” to “{cid}”")),
                 (n, _) => Notification::success(format!("Added {} to “{cid}”", count_papers(n))),
             };
             window.push_notification(note, cx);
@@ -790,27 +920,54 @@ impl PaprApp {
         });
     }
 
+    /// Writes `Collections/<cid>/references.bib`.
+    fn export_collection_bib(&mut self, cid: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.library.export_collection_bib(cid) {
+            Ok(summary) => {
+                let path = summary.path.strip_prefix(self.library.root()).unwrap_or(&summary.path);
+                let mut msg = format!(
+                    "Wrote {} with {} entr{}",
+                    path.display(),
+                    summary.entries,
+                    if summary.entries == 1 { "y" } else { "ies" }
+                );
+                if !summary.missing.is_empty() {
+                    msg.push_str(&format!(
+                        ". {} without BibTeX {} left out.",
+                        count_papers(summary.missing.len()),
+                        if summary.missing.len() == 1 { "was" } else { "were" }
+                    ));
+                }
+                window.push_notification(Notification::success(msg), cx);
+            }
+            Err(err) => Self::notify_error(window, cx, err),
+        }
+    }
+
     // ----- rendering ------------------------------------------------------------
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let library_count = self.library.papers().len();
 
-        let library_item = h_flex()
-            .id("nav-library")
-            .gap_2()
-            .px_2()
-            .py_1p5()
-            .rounded(theme.radius)
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.sidebar_accent))
-            .when(self.view == View::Library, |s| {
-                s.bg(theme.sidebar_accent)
-                    .text_color(theme.sidebar_accent_foreground)
-                    .font_medium()
-            })
-            .child(Icon::new(IconName::BookOpen).small())
-            .child(div().flex_1().child("My Library"))
+        let nav_item = |id: &'static str, icon: IconName, label: &'static str, active: bool| {
+            h_flex()
+                .id(id)
+                .gap_2()
+                .px_2()
+                .py_1p5()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.sidebar_accent))
+                .when(active, |s| {
+                    s.bg(theme.sidebar_accent)
+                        .text_color(theme.sidebar_accent_foreground)
+                        .font_medium()
+                })
+                .child(Icon::new(icon).small())
+                .child(div().flex_1().child(label))
+        };
+        let library_item = nav_item("nav-library", IconName::BookOpen, "My Library", self.view == View::Library)
             .child(
                 div()
                     .text_xs()
@@ -818,6 +975,8 @@ impl PaprApp {
                     .child(library_count.to_string()),
             )
             .on_click(cx.listener(|this, _, window, cx| this.set_view(View::Library, window, cx)));
+        let scholar_item = nav_item("nav-scholar", IconName::Search, "Google Scholar", self.view == View::Scholar)
+            .on_click(cx.listener(|this, _, window, cx| this.set_view(View::Scholar, window, cx)));
 
         let collections = self.library.collections().iter().enumerate().map(|(ix, c)| {
             let cid = c.id.clone();
@@ -826,11 +985,10 @@ impl PaprApp {
             h_flex()
                 .id(ElementId::NamedInteger("collection".into(), ix as u64))
                 .group(group.clone())
-                .relative()
                 .gap_2()
                 .pl_2()
                 .pr_1()
-                .py_1()
+                .h(px(32.))
                 .rounded(theme.radius)
                 .border_1()
                 .border_color(transparent_black())
@@ -876,19 +1034,24 @@ impl PaprApp {
                     .small(),
                 )
                 .child(div().flex_1().min_w_0().truncate().child(c.name().to_string()))
+                // The paper count, swapped for rename/delete buttons on hover
+                // (they take its place rather than drawing over it).
                 .child(
-                    // Overlays the paper count while hovering, so long names
-                    // aren't truncated by invisible buttons.
+                    div()
+                        .id(ElementId::NamedInteger("col-count".into(), ix as u64))
+                        .min_w(px(20.))
+                        .text_right()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .group_hover(group.clone(), |s| s.hidden())
+                        .child(c.papers.len().to_string())
+                        .test_support(),
+                )
+                .child(
                     h_flex()
-                        .absolute()
-                        .right_1()
-                        .top_0()
-                        .bottom_0()
-                        .pl_1()
-                        .rounded(theme.radius)
-                        .bg(theme.sidebar_accent)
-                        .invisible()
-                        .group_hover(group.clone(), |s| s.visible())
+                        .id(ElementId::NamedInteger("col-actions".into(), ix as u64))
+                        .hidden()
+                        .group_hover(group.clone(), |s| s.flex())
                         .child(
                             Button::new(ElementId::NamedInteger("rename-col".into(), ix as u64))
                                 .ghost()
@@ -920,14 +1083,7 @@ impl PaprApp {
                                 })),
                         ),
                 )
-                .child(
-                    div()
-                        .w(px(20.))
-                        .text_right()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(c.papers.len().to_string()),
-                )
+                .test_support()
         });
 
         v_flex()
@@ -940,9 +1096,12 @@ impl PaprApp {
             .border_r_1()
             .border_color(theme.sidebar_border)
             .text_sm()
-            // Clicking anywhere in the sidebar closes the right-hand pane.
+            // Clicking anywhere in the sidebar closes the paper details pane.
+            // (The Google Scholar pane keeps its draft; it has its own close button.)
             .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                this.close_side_panel(window, cx)
+                if this.view != View::Scholar {
+                    this.close_side_panel(window, cx)
+                }
             }))
             .child(
                 h_flex()
@@ -966,7 +1125,7 @@ impl PaprApp {
                             })),
                     ),
             )
-            .child(v_flex().px_2().child(library_item))
+            .child(v_flex().px_2().gap_0p5().child(library_item).child(scholar_item))
             .child(
                 h_flex()
                     .mt_4()
@@ -1022,11 +1181,30 @@ impl PaprApp {
         let theme = cx.theme();
         let id = paper.id.clone();
         let selected = self.selection.contains(&id);
+        let info = paper.info();
         let collections: Vec<&str> = self.library.collections_of(&id).map(|c| c.name()).collect();
-        let mut subtitle = format_size(paper.size_bytes);
-        if !collections.is_empty() {
-            subtitle.push_str(&format!(" · {}", collections.join(", ")));
+
+        let mut meta = Vec::new();
+        if let Some(year) = info.and_then(|i| i.year.as_ref()) {
+            meta.push(year.clone());
         }
+        if let Some(pdf) = &paper.pdf {
+            meta.push(format_size(pdf.size));
+        }
+        if !collections.is_empty() {
+            meta.push(collections.join(", "));
+        }
+
+        let mut warnings = Vec::new();
+        if paper.pdf.is_none() {
+            warnings.push("No PDF");
+        }
+        match &paper.bib {
+            None => warnings.push("No BibTeX"),
+            Some(bib) if bib.error.is_some() => warnings.push("BibTeX unreadable"),
+            Some(_) => {}
+        }
+
         // Dragging a selected paper drags the whole selection.
         let drag = if selected && self.selection.len() > 1 {
             DraggedPapers {
@@ -1036,15 +1214,16 @@ impl PaprApp {
         } else {
             DraggedPapers {
                 ids: vec![id.clone()],
-                label: paper.title.clone().into(),
+                label: paper.title().to_string().into(),
             }
         };
 
         h_flex()
             .id(ElementId::NamedInteger("paper".into(), ix as u64))
+            .items_start()
             .gap_3()
             .px_4()
-            .py_2()
+            .py_2p5()
             .border_b_1()
             .border_color(theme.border)
             .cursor_pointer()
@@ -1060,83 +1239,119 @@ impl PaprApp {
                     // Display only: the row's click handler does the toggling.
                     // (Click events bubble to parents in GPUI, so giving the
                     // checkbox its own handler would toggle twice.)
-                    Checkbox::new(ElementId::NamedInteger("pick".into(), ix as u64))
-                        .checked(selected),
+                    div().pt_0p5().child(
+                        Checkbox::new(ElementId::NamedInteger("pick".into(), ix as u64))
+                            .checked(selected),
+                    ),
                 )
             })
-            .child(Icon::new(IconName::FileText).text_color(theme.muted_foreground))
+            .child(
+                div().pt_0p5().child(
+                    Icon::new(if paper.pdf.is_some() {
+                        IconName::FileText
+                    } else {
+                        IconName::File
+                    })
+                    .text_color(theme.muted_foreground),
+                ),
+            )
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .child(div().truncate().font_medium().child(paper.title.clone()))
+                    .gap_0p5()
                     .child(
-                        div()
-                            .truncate()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(subtitle),
-                    ),
+                        h_flex()
+                            .gap_2()
+                            .child(div().min_w_0().truncate().font_medium().child(paper.title().to_string()))
+                            .children(warnings.into_iter().map(|w| warning_badge(w, cx))),
+                    )
+                    .when_some(info.filter(|i| !i.authors.is_empty()), |col, info| {
+                        col.child(
+                            div()
+                                .truncate()
+                                .text_sm()
+                                .child(info.authors.join(", ")),
+                        )
+                    })
+                    .when_some(info.and_then(|i| i.abstract_.clone()), |col, abstract_| {
+                        col.child(
+                            div()
+                                .text_xs()
+                                // Without an ellipsis, gpui puts all remaining text on the last
+                                // line and clips it mid-word.
+                                .line_clamp(2)
+                                .text_ellipsis()
+                                .text_color(theme.muted_foreground)
+                                .child(abstract_),
+                        )
+                    })
+                    .when(!meta.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(meta.join(" · ")),
+                        )
+                    }),
             )
-            .child(
-                Button::new(ElementId::NamedInteger("open".into(), ix as u64))
-                    .ghost()
-                    .small()
-                    .icon(IconName::ExternalLink)
-                    .tooltip("Open PDF")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        // Don't also select/toggle the row.
-                        cx.stop_propagation();
-                        this.open_paper(&id, window, cx)
-                    })),
-            )
+            .when(paper.pdf.is_some(), |row| {
+                row.child(
+                    Button::new(ElementId::NamedInteger("open".into(), ix as u64))
+                        .ghost()
+                        .small()
+                        .icon(IconName::ExternalLink)
+                        .tooltip("Open PDF")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // Don't also select/toggle the row.
+                            cx.stop_propagation();
+                            this.open_paper(&id, window, cx)
+                        })),
+                )
+            })
             // Lets UI tests click rows; a no-op in normal builds.
             .test_support()
             .into_any_element()
     }
 
-    fn render_main(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.view == View::Scholar {
+            return self.render_scholar_main(cx);
+        }
         let papers = self.visible_papers(cx);
-        let theme = cx.theme();
         let heading = match &self.view {
-            View::Library => "My Library".to_string(),
             View::Collection(cid) => cid.clone(),
+            _ => "My Library".to_string(),
         };
         let searching = !self.search_input.read(cx).value().trim().is_empty();
         let drop_hint = match self.view {
-            View::Library => "Drop PDFs here to add them to your library".to_string(),
             View::Collection(_) => format!("Drop PDFs here to add them to “{heading}”"),
+            _ => "Drop PDFs here to add them to your library".to_string(),
         };
 
-        // Two rows: the title (aligned with the sidebar and side-pane
-        // headers), then full-size search and actions, which keeps everything
-        // readable when the window is narrow.
-        let title_row = h_flex()
-            .px_4()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_shrink_0()
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_2()
-                    .items_baseline()
-                    .child(div().min_w_0().truncate().text_xl().font_semibold().child(heading))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(count_papers(papers.len())),
-                    ),
-            );
-        let controls_row = h_flex()
-            .gap_2()
-            .px_4()
-            .pb_3()
-            .flex_shrink_0()
-            .border_b_1()
-            .border_color(theme.border)
+        let export_button = match &self.view {
+            View::Collection(cid) => {
+                let cid = cid.clone();
+                Some(
+                    Button::new("export-bib")
+                        .outline()
+                        .flex_shrink_0()
+                        .icon(IconName::FileText)
+                        .label("Export BibTeX")
+                        .tooltip(format!(
+                            "Write every paper's BibTeX, sorted by title, to Collections/{cid}/{EXPORT_FILE}"
+                        ))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.export_collection_bib(&cid, window, cx)
+                        })),
+                )
+            }
+            _ => None,
+        };
+
+        let title_row = title_row(heading, count_papers(papers.len()), cx).children(export_button);
+        let controls_row = controls_row(cx)
             .child(
                 div().flex_1().min_w(px(120.)).child(
                     Input::new(&self.search_input)
@@ -1173,17 +1388,8 @@ impl PaprApp {
             } else {
                 ("Nothing here yet".to_string(), drop_hint)
             };
-            v_flex()
-                .id("empty")
-                .flex_1()
+            empty_state(IconName::Inbox, title, hint, cx)
                 .on_click(cx.listener(|this, _, window, cx| this.close_side_panel(window, cx)))
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .text_color(theme.muted_foreground)
-                .child(Icon::new(IconName::Inbox).size(px(40.)))
-                .child(div().text_base().font_medium().child(title))
-                .child(div().text_sm().child(hint))
         } else {
             v_flex()
                 .id("papers")
@@ -1232,18 +1438,15 @@ impl PaprApp {
                     })
                     .child(body),
             )
+            .into_any_element()
     }
 
     /// The right-hand pane's frame: a title with a close button, then content.
-    fn side_panel(
-        &self,
-        title: impl Into<SharedString>,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
+    fn side_panel(&self, title: impl Into<SharedString>, cx: &Context<Self>) -> Stateful<Div> {
         let theme = cx.theme();
         v_flex()
             .id("side-panel")
-            .w(px(300.))
+            .w(px(SIDE_PANEL_WIDTH))
             .h_full()
             .flex_shrink_0()
             .overflow_y_scroll()
@@ -1281,7 +1484,9 @@ impl PaprApp {
 
     fn render_details(&self, paper: &Paper, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        let hint = theme.muted_foreground;
         let id = paper.id.clone();
+        let info = paper.info().cloned().unwrap_or_default();
 
         let info_row = |label: &'static str, value: String| {
             h_flex()
@@ -1296,7 +1501,6 @@ impl PaprApp {
                 )
                 .child(div().min_w_0().truncate().child(value))
         };
-        let hint = theme.muted_foreground;
 
         let memberships = self.library.collections().iter().enumerate().map(|(ix, c)| {
             let cid = c.id.clone();
@@ -1330,12 +1534,169 @@ impl PaprApp {
                         })),
                 )
             }
-            View::Library => None,
+            _ => None,
         };
 
+        // PDF actions: open/replace, or attach if there's none yet.
+        let pdf_actions = v_flex().mt_4().gap_2().map(|col| {
+            if paper.pdf.is_some() {
+                col.child(
+                    Button::new("open-pdf")
+                        .primary()
+                        .w_full()
+                        .icon(IconName::ExternalLink)
+                        .label("Open PDF")
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| this.open_paper(&id, window, cx)
+                        })),
+                )
+                .child(
+                    Button::new("replace-pdf")
+                        .outline()
+                        .w_full()
+                        .icon(Lucide::FilePlus)
+                        .label("Replace PDF…")
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| this.prompt_attach_pdf(id.clone(), window, cx)
+                        })),
+                )
+            } else {
+                col.child(notice(
+                    "No PDF yet",
+                    "Download it (see the links below), then drop it onto this panel or choose it.",
+                    cx,
+                ))
+                .child(
+                    Button::new("attach-pdf")
+                        .primary()
+                        .w_full()
+                        .icon(Lucide::FilePlus)
+                        .label("Attach PDF…")
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| this.prompt_attach_pdf(id.clone(), window, cx)
+                        })),
+                )
+            }
+            .child(
+                Button::new("reveal")
+                    .outline()
+                    .w_full()
+                    .icon(IconName::FolderOpen)
+                    .label("Show in folder")
+                    .on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| {
+                            if let Some(path) = this.library.any_path(&id) {
+                                cx.reveal_path(&path)
+                            }
+                        }
+                    })),
+            )
+            .children(link_buttons(&info, cx))
+        });
+
+        // BibTeX: show it, or offer to find it.
+        let bib_section = v_flex().gap_1().map(|col| match &paper.bib {
+            Some(bib) => col
+                .when_some(bib.error.clone(), |col, error| {
+                    col.child(notice("Can't read the .bib file", error, cx))
+                })
+                .when(!info.authors.is_empty(), |col| {
+                    col.child(div().child(info.authors.join(", ")))
+                })
+                .when_some(
+                    Some(
+                        [info.year.clone(), info.venue.clone()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    )
+                    .filter(|s| !s.is_empty()),
+                    |col, line| col.child(div().text_xs().text_color(hint).child(line)),
+                )
+                .when_some(info.abstract_.clone(), |col, abstract_| {
+                    col.child(div().mt_1().text_xs().child(abstract_))
+                })
+                .child(
+                    h_flex()
+                        .mt_2()
+                        .gap_2()
+                        .child(
+                            Button::new("copy-bib")
+                                .outline()
+                                .flex_1()
+                                .icon(IconName::Copy)
+                                .label("Copy BibTeX")
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, window, cx| this.copy_bibtex(&id, window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("edit-bib")
+                                .outline()
+                                .flex_1()
+                                .icon(Lucide::Pencil)
+                                .label("Edit .bib")
+                                .tooltip("Open the .bib file in your text editor")
+                                .on_click(cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, _, cx| {
+                                        if let Some(path) = this.library.bib_path(&id) {
+                                            cx.open_with_system(&path)
+                                        }
+                                    }
+                                })),
+                        ),
+                ),
+            None => col
+                .child(notice(
+                    "No BibTeX yet",
+                    "Find this paper on Google Scholar to save its title, authors, abstract and citation.",
+                    cx,
+                ))
+                .child(
+                    Button::new("find-on-scholar")
+                        .outline()
+                        .w_full()
+                        .mt_1()
+                        .icon(IconName::Search)
+                        .label("Find on Google Scholar")
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| this.find_on_scholar(id.clone(), window, cx)
+                        })),
+                ),
+        });
+
+        let modified = paper
+            .pdf
+            .as_ref()
+            .map(|f| f.modified)
+            .or(paper.bib.as_ref().map(|b| b.file.modified))
+            .unwrap_or(0);
+        let mut info_rows = v_flex().gap_1();
+        for (ix, path) in self.library.relative_paths(&id).into_iter().enumerate() {
+            info_rows = info_rows.child(info_row(if ix == 0 { "Files" } else { "" }, path));
+        }
+        if let Some(pdf) = &paper.pdf {
+            info_rows = info_rows.child(info_row("Size", format_size(pdf.size)));
+        }
+        info_rows = info_rows.child(info_row("Modified", format_date(modified)));
+
         let no_collections = self.library.collections().is_empty();
+        let drop_id = id.clone();
 
         self.side_panel("Details", cx)
+            // Drop a PDF onto the pane to attach (or replace) it.
+            .drag_over::<ExternalPaths>(|s, _, _, cx| s.bg(cx.theme().drop_target))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                this.drop_pdf_on_paper(drop_id.clone(), paths.paths().to_vec(), window, cx)
+            }))
             .child(section_label("NAME", hint).mt_0())
             .child(Input::new(&self.title_input))
             .child(
@@ -1343,45 +1704,13 @@ impl PaprApp {
                     .mt_1()
                     .text_xs()
                     .text_color(hint)
-                    .child("Renames the PDF file. Press Enter to save."),
+                    .child("Renames the paper's files. Press Enter to save."),
             )
-            .child(
-                v_flex()
-                    .mt_4()
-                    .gap_2()
-                    .child(
-                        Button::new("open-pdf")
-                            .primary()
-                            .w_full()
-                            .icon(IconName::ExternalLink)
-                            .label("Open PDF")
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _, window, cx| this.open_paper(&id, window, cx)
-                            })),
-                    )
-                    .child(
-                        Button::new("reveal")
-                            .outline()
-                            .w_full()
-                            .icon(IconName::FolderOpen)
-                            .label("Show in folder")
-                            .on_click(cx.listener({
-                                let id = id.clone();
-                                move |this, _, _, cx| {
-                                    cx.reveal_path(&this.library.paper_path(&id))
-                                }
-                            })),
-                    ),
-            )
+            .child(pdf_actions)
+            .child(section_label("BIBTEX", hint))
+            .child(bib_section)
             .child(section_label("INFO", hint))
-            .child(
-                v_flex()
-                    .gap_1()
-                    .child(info_row("File", self.library.relative_path(&id)))
-                    .child(info_row("Size", format_size(paper.size_bytes)))
-                    .child(info_row("Modified", format_date(paper.modified))),
-            )
+            .child(info_rows)
             .child(section_label("COLLECTIONS", hint))
             .child(
                 v_flex()
@@ -1450,7 +1779,7 @@ impl PaprApp {
                         })),
                 )
             }
-            View::Library => None,
+            _ => None,
         };
 
         self.side_panel(title, cx)
@@ -1523,10 +1852,13 @@ impl PaprApp {
 const TOOLBAR_HEIGHT: f32 = 60.;
 /// Width of the Select/Done and Add buttons next to the search bar.
 const TOOLBAR_BUTTON_WIDTH: f32 = 88.;
+const SIDE_PANEL_WIDTH: f32 = 320.;
 
 impl Render for PaprApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let side_panel = if let Some(paper) = self
+        let side_panel = if self.view == View::Scholar {
+            self.render_scholar_panel(cx)
+        } else if let Some(paper) = self
             .single_selection()
             .and_then(|id| self.library.paper(id))
             .cloned()
@@ -1547,14 +1879,134 @@ impl Render for PaprApp {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            // Files dropped anywhere in the window go into the current view.
+            // Files dropped anywhere else in the window.
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.import_paths(paths.paths(), None, window, cx)
+                this.drop_files(paths, window, cx)
             }))
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
             .children(side_panel)
     }
+}
+
+// ----- shared pieces ------------------------------------------------------------
+
+/// The top row of the main panel: a large title and a muted subtitle.
+fn title_row(title: impl Into<SharedString>, subtitle: impl Into<SharedString>, cx: &App) -> Div {
+    h_flex()
+        .gap_3()
+        .px_4()
+        .h(px(TOOLBAR_HEIGHT))
+        .flex_shrink_0()
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .items_baseline()
+                .child(div().min_w_0().truncate().text_xl().font_semibold().child(title.into()))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(subtitle.into()),
+                ),
+        )
+}
+
+/// The second row of the main panel, for search and actions.
+fn controls_row(cx: &App) -> Div {
+    h_flex()
+        .gap_2()
+        .px_4()
+        .pb_3()
+        .flex_shrink_0()
+        .border_b_1()
+        .border_color(cx.theme().border)
+}
+
+fn empty_state(
+    icon: IconName,
+    title: impl Into<SharedString>,
+    hint: impl Into<SharedString>,
+    cx: &App,
+) -> Stateful<Div> {
+    v_flex()
+        .id("empty")
+        .flex_1()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_8()
+        .text_center()
+        .text_color(cx.theme().muted_foreground)
+        .child(Icon::new(icon).size(px(40.)))
+        .child(div().text_base().font_medium().child(title.into()))
+        .child(div().text_sm().child(hint.into()))
+}
+
+/// A small inline warning, e.g. "No PDF".
+fn warning_badge(text: &'static str, cx: &App) -> impl IntoElement {
+    h_flex()
+        .flex_shrink_0()
+        .gap_1()
+        .px_1p5()
+        .rounded(cx.theme().radius)
+        .bg(cx.theme().warning.opacity(0.15))
+        .text_color(cx.theme().warning)
+        .text_xs()
+        .child(Icon::new(IconName::TriangleAlert).xsmall())
+        .child(text)
+}
+
+/// A highlighted box explaining something that needs attention.
+fn notice(title: impl Into<SharedString>, body: impl Into<SharedString>, cx: &App) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .p_3()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().warning.opacity(0.5))
+        .bg(cx.theme().warning.opacity(0.08))
+        .child(
+            h_flex()
+                .gap_1p5()
+                .text_color(cx.theme().warning)
+                .font_medium()
+                .child(Icon::new(IconName::TriangleAlert).small())
+                .child(title.into()),
+        )
+        .child(div().text_xs().child(body.into()))
+}
+
+/// "Open PDF link" / "Open publication page" buttons for a paper's URLs.
+fn link_buttons(info: &crate::library::BibInfo, cx: &App) -> Vec<Button> {
+    let _ = cx;
+    let mut buttons = Vec::new();
+    if let Some(url) = info.pdf_url.clone() {
+        buttons.push(
+            Button::new("open-pdf-link")
+                .outline()
+                .w_full()
+                .icon(IconName::Globe)
+                .label("Open PDF link")
+                .tooltip(url.clone())
+                .on_click(move |_, _, cx| cx.open_url(&url)),
+        );
+    }
+    if let Some(url) = info.url.clone() {
+        buttons.push(
+            Button::new("open-pub-page")
+                .outline()
+                .w_full()
+                .icon(IconName::Globe)
+                .label("Open publication page")
+                .tooltip(url.clone())
+                .on_click(move |_, _, cx| cx.open_url(&url)),
+        );
+    }
+    buttons
 }
 
 fn section_label(label: &'static str, color: Hsla) -> Div {
@@ -1637,7 +2089,6 @@ mod tests {
         assert_eq!(count_papers(3), "3 papers");
     }
 }
-
 /// Headless UI tests: render the real view and click it with real hit-testing.
 #[cfg(test)]
 mod ui_tests {
@@ -1651,7 +2102,8 @@ mod ui_tests {
     };
     use std::path::PathBuf;
 
-    /// A library with three papers: "A paper", "B paper", "C paper".
+    /// A library with PDFs "A paper", "B paper", "C paper", a BibTeX-only
+    /// "D paper", and a collection "Thesis" containing "A paper".
     struct Fixture {
         root: PathBuf,
         window: AnyWindowHandle,
@@ -1671,6 +2123,14 @@ mod ui_tests {
         for title in ["A paper", "B paper", "C paper"] {
             std::fs::write(root.join(format!("Library/{title}.pdf")), title).unwrap();
         }
+        // "D paper" only has BibTeX (as if added from Google Scholar).
+        std::fs::write(
+            root.join("Library/D paper.bib"),
+            "@article{d2020, title={D paper}, author={Doe, Jane}, abstract={About D.}}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("Collections/Thesis")).unwrap();
+        std::os::unix::fs::symlink("../../Library/A paper.pdf", root.join("Collections/Thesis/A paper.pdf")).unwrap();
         let library = Library::open(&root).unwrap();
 
         let (window, app) = cx.update(|cx| {
@@ -1726,12 +2186,12 @@ mod ui_tests {
     fn clicking_a_paper_selects_it_and_opens_details(cx: &mut TestAppContext) {
         let f = open(cx, "click");
         click(&f, cx, row(1));
-        assert_eq!(selection(&f, cx), vec!["B paper.pdf"]);
+        assert_eq!(selection(&f, cx), vec!["B paper"]);
         assert!(panel_open(&f, cx));
 
         // Clicking another paper switches the selection.
         click(&f, cx, row(2));
-        assert_eq!(selection(&f, cx), vec!["C paper.pdf"]);
+        assert_eq!(selection(&f, cx), vec!["C paper"]);
     }
 
     #[gpui_kit::test]
@@ -1742,12 +2202,12 @@ mod ui_tests {
 
         click(&f, cx, row(0));
         click(&f, cx, row(2));
-        assert_eq!(selection(&f, cx), vec!["A paper.pdf", "C paper.pdf"]);
+        assert_eq!(selection(&f, cx), vec!["A paper", "C paper"]);
         assert!(select_mode(&f, cx), "clicking rows must not leave select mode");
 
         // Clicking a selected paper deselects it.
         click(&f, cx, row(0));
-        assert_eq!(selection(&f, cx), vec!["C paper.pdf"]);
+        assert_eq!(selection(&f, cx), vec!["C paper"]);
 
         // "Done" leaves select mode and clears the selection.
         click(&f, cx, "select-mode");
@@ -1778,11 +2238,80 @@ mod ui_tests {
         let f = open(cx, "open-button");
         click(&f, cx, "select-mode");
         click(&f, cx, row(0));
-        assert_eq!(selection(&f, cx), vec!["A paper.pdf"]);
+        assert_eq!(selection(&f, cx), vec!["A paper"]);
         // The test platform can't launch a viewer, so remove the file:
         // Open then just reports it missing.
         std::fs::remove_file(f.root.join("Library/A paper.pdf")).unwrap();
         click(&f, cx, ElementId::NamedInteger("open".into(), 0));
-        assert_eq!(selection(&f, cx), vec!["A paper.pdf"]);
+        assert_eq!(selection(&f, cx), vec!["A paper"]);
+    }
+
+    fn find(f: &Fixture, cx: &mut TestAppContext, id: impl Into<ElementId>) -> Option<(bool, gpui_kit::Bounds<gpui_kit::Pixels>)> {
+        let id = id.into();
+        cx.update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(id).map(|s| (s.visible(), s.bounds()))
+        })
+        .unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn papers_without_a_pdf_offer_to_attach_one(cx: &mut TestAppContext) {
+        let f = open(cx, "attach");
+        click(&f, cx, row(3));
+        assert_eq!(selection(&f, cx), vec!["D paper"]);
+        assert!(find(&f, cx, "attach-pdf").is_some());
+        assert!(find(&f, cx, "open-pdf").is_none());
+        assert!(find(&f, cx, "copy-bib").is_some());
+        // No per-row Open button without a PDF.
+        assert!(find(&f, cx, ElementId::NamedInteger("open".into(), 3)).is_none());
+
+        // A PDF without BibTeX offers to find it instead.
+        click(&f, cx, row(0));
+        assert!(find(&f, cx, "find-on-scholar").is_some());
+        assert!(find(&f, cx, "open-pdf").is_some());
+    }
+
+    #[gpui_kit::test]
+    fn collections_export_their_bibtex(cx: &mut TestAppContext) {
+        let f = open(cx, "export");
+        std::fs::write(
+            f.root.join("Library/A paper.bib"),
+            "@article{a2020, title={A paper}}",
+        )
+        .unwrap();
+        cx.update_window(f.window, |_, window, cx| {
+            f.app.update(cx, |app, cx| app.refresh(window, cx));
+        })
+        .unwrap();
+        assert!(find(&f, cx, "export-bib").is_none(), "only shown for collections");
+        click(&f, cx, ElementId::NamedInteger("collection".into(), 0));
+        click(&f, cx, "export-bib");
+        let text = std::fs::read_to_string(f.root.join("Collections/Thesis/references.bib")).unwrap();
+        assert!(text.contains("@article{a2020"));
+    }
+
+    #[gpui_kit::test]
+    fn collection_actions_replace_the_count_on_hover(cx: &mut TestAppContext) {
+        let f = open(cx, "hover");
+        let count = ElementId::NamedInteger("col-count".into(), 0);
+        let delete = ElementId::NamedInteger("delete-col".into(), 0);
+        assert!(find(&f, cx, count.clone()).is_some_and(|(visible, _)| visible));
+        assert!(!find(&f, cx, delete.clone()).is_some_and(|(visible, _)| visible));
+
+        cx.update_window(f.window, |_, window, cx| {
+            window.render_frame(cx);
+            window.hover(ElementId::NamedInteger("collection".into(), 0), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (delete_visible, delete_bounds) = find(&f, cx, delete).expect("delete button");
+        assert!(delete_visible);
+        // The count is gone, not drawn underneath the buttons.
+        if let Some((visible, bounds)) = find(&f, cx, count) {
+            assert!(!visible || bounds.size.width == gpui_kit::px(0.));
+        }
+        let (_, row_bounds) = find(&f, cx, ElementId::NamedInteger("collection".into(), 0)).unwrap();
+        assert!(delete_bounds.right() <= row_bounds.right());
     }
 }

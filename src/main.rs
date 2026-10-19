@@ -1,5 +1,7 @@
 mod app;
+mod bibtex;
 mod library;
+mod scholar;
 
 use gpui_kit::*;
 
