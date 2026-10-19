@@ -86,7 +86,7 @@ pub struct PaprApp {
 impl PaprApp {
     pub fn new(library: Library, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Paper name"));
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search papers…"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search titles, authors and abstracts…"));
         let (scholar, scholar_subscription) = ScholarState::new(window, cx);
 
         // Follow the system's light/dark setting, now and when it changes.
@@ -253,6 +253,7 @@ impl PaprApp {
                     || p.info().is_some_and(|i| {
                         i.authors.iter().any(|a| a.to_lowercase().contains(&query))
                             || i.title.as_ref().is_some_and(|t| t.to_lowercase().contains(&query))
+                            || i.abstract_.as_ref().is_some_and(|a| a.to_lowercase().contains(&query))
                     })
             });
         }
@@ -938,7 +939,30 @@ impl PaprApp {
                         if summary.missing.len() == 1 { "was" } else { "were" }
                     ));
                 }
-                window.push_notification(Notification::success(msg), cx);
+                let file = summary.path.clone();
+                // The button goes in the notification's content (below the
+                // message) rather than its `action` slot, which sits to the
+                // right of the text.
+                let note = Notification::success(msg)
+                    .autohide(false)
+                    .content(move |_, _, cx| {
+                        let file = file.clone();
+                        h_flex()
+                            .mt_2()
+                            .child(
+                                Button::new("open-export")
+                                    .outline()
+                                    .small()
+                                    .icon(IconName::ExternalLink)
+                                    .label(format!("Open {EXPORT_FILE}"))
+                                    .on_click(cx.listener(move |note, _, window, cx| {
+                                        cx.open_with_system(&file);
+                                        note.dismiss(window, cx);
+                                    })),
+                            )
+                            .into_any_element()
+                    });
+                window.push_notification(note, cx);
             }
             Err(err) => Self::notify_error(window, cx, err),
         }
@@ -1891,8 +1915,34 @@ impl Render for PaprApp {
 
 // ----- shared pieces ------------------------------------------------------------
 
-/// The top row of the main panel: a large title and a muted subtitle.
+/// The top row of the main panel: a large title and a muted subtitle
+/// (e.g. "My Library  3 papers"), sharing a baseline.
 fn title_row(title: impl Into<SharedString>, subtitle: impl Into<SharedString>, cx: &App) -> Div {
+    const TITLE_SIZE: f32 = 20.;
+    const SUBTITLE_SIZE: f32 = 14.;
+    const LINE_HEIGHT: f32 = 28.;
+
+    // GPUI text doesn't report a baseline to the layout engine, so
+    // `items_baseline` aligns the bottoms of the line boxes instead, which
+    // puts the smaller text too low. Give both texts the same line height,
+    // align their tops, and move the subtitle down by the difference between
+    // the two baselines, computed from the theme font's real metrics.
+    let text_system = cx.text_system();
+    let baseline = |weight: FontWeight, size: f32| {
+        let font_id = text_system.resolve_font(&Font {
+            weight,
+            ..font(cx.theme().font_family.clone())
+        });
+        // Same as how GPUI positions a line's glyphs. (Not
+        // `TextSystem::baseline_offset`: it assumes a positive descent, but
+        // some platforms report it as negative.)
+        let ascent = text_system.ascent(font_id, px(size));
+        let descent = text_system.descent(font_id, px(size)).abs();
+        (px(LINE_HEIGHT) - ascent - descent) / 2. + ascent
+    };
+    let subtitle_offset =
+        baseline(FontWeight::SEMIBOLD, TITLE_SIZE) - baseline(FontWeight::NORMAL, SUBTITLE_SIZE);
+
     h_flex()
         .gap_3()
         .px_4()
@@ -1903,12 +1953,22 @@ fn title_row(title: impl Into<SharedString>, subtitle: impl Into<SharedString>, 
                 .flex_1()
                 .min_w_0()
                 .gap_2()
-                .items_baseline()
-                .child(div().min_w_0().truncate().text_xl().font_semibold().child(title.into()))
+                .items_start()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(TITLE_SIZE))
+                        .line_height(px(LINE_HEIGHT))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.into()),
+                )
                 .child(
                     div()
                         .flex_shrink_0()
-                        .text_sm()
+                        .mt(subtitle_offset)
+                        .text_size(px(SUBTITLE_SIZE))
+                        .line_height(px(LINE_HEIGHT))
                         .text_color(cx.theme().muted_foreground)
                         .child(subtitle.into()),
                 ),
@@ -2289,6 +2349,8 @@ mod ui_tests {
         click(&f, cx, "export-bib");
         let text = std::fs::read_to_string(f.root.join("Collections/Thesis/references.bib")).unwrap();
         assert!(text.contains("@article{a2020"));
+        // The toast offers to open the file.
+        assert!(find(&f, cx, "open-export").is_some_and(|(visible, _)| visible));
     }
 
     #[gpui_kit::test]
@@ -2313,5 +2375,23 @@ mod ui_tests {
         }
         let (_, row_bounds) = find(&f, cx, ElementId::NamedInteger("collection".into(), 0)).unwrap();
         assert!(delete_bounds.right() <= row_bounds.right());
+    }
+
+    #[gpui_kit::test]
+    fn search_matches_titles_authors_and_abstracts(cx: &mut TestAppContext) {
+        let f = open(cx, "search");
+        let search = |cx: &mut TestAppContext, query: &'static str| -> Vec<String> {
+            cx.update_window(f.window, |_, window, cx| {
+                f.app.update(cx, |app, cx| {
+                    app.search_input.update(cx, |s, cx| s.set_value(query, window, cx))
+                })
+            })
+            .unwrap();
+            f.app.read_with(cx, |app, cx| app.visible_papers(cx).into_iter().map(|p| p.id).collect())
+        };
+        assert_eq!(search(cx, "about d"), vec!["D paper"], "abstract");
+        assert_eq!(search(cx, "JANE DOE"), vec!["D paper"], "author");
+        assert_eq!(search(cx, "b pap"), vec!["B paper"], "title");
+        assert_eq!(search(cx, "").len(), 4);
     }
 }

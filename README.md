@@ -16,10 +16,10 @@ A small research-paper manager written in Rust with [gpui-kit](https://gpui-kit.
 - **Collections** (e.g. one per project): you can add the same paper to several collections without
   copying anything. Drag papers from the list onto a collection, tick it in the details pane, or drop
   PDFs straight onto a collection. **Export BibTeX** writes the collection's bibliography,
-  sorted by title, to `Collections/<name>/references.bib`.
+  sorted by title, to `Collections/<name>/references.bib`; the notification has a button to open it.
 - **Rename** a paper in the details pane. This renames its PDF and BibTeX files.
 - **Open PDF** opens the file in the system's default PDF viewer (double-clicking a row does the same).
-- **Search** filters papers by name or author.
+- **Search** filters papers by name, author or abstract.
 - **Multi-select**: click **Select** (or Ctrl/Cmd-click, Shift-click for a range, Ctrl/Cmd+A for
   all) to select several papers. You can then add them all to a collection, start a new collection
   from them, remove them from the current collection, delete them, or drag them onto a collection.
